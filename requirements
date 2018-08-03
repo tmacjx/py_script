@@ -1,3 +1,5 @@
 redis
 requests
 tabulate
+pylint
+coverage
