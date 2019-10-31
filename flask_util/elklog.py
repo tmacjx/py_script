@@ -1,44 +1,20 @@
-import os
-import re
-import json
-import uuid
-import time
-import logging
-import fcntl
+"""
+# @Author  wk
+# @Time 2019/10/11 11:13
+
+"""
 import socket
-import traceback
-from logging.handlers import TimedRotatingFileHandler
+import re
+import os
+import time
+import uuid
 from datetime import datetime
-
-
-JSON_SERIALIZER = json.dumps
-REQ_ID_GENERATOR = uuid.uuid1
-_request_util = None
-# 1 API相关
-PLATFORM_CODE = 'ccapi'
-
-
-def iso_time_format(datetime_):
-    return '%04d-%02d-%02dT%02d:%02d:%02d.%03dZ' % (
-        datetime_.year, datetime_.month, datetime_.day, datetime_.hour, datetime_.minute, datetime_.second,
-        int(datetime_.microsecond / 1000))
-
-
-def is_flask_present():
-    # noinspection PyPep8,PyBroadException
-    try:
-        import flask
-        return True
-    except:
-        return False
-
-
-if is_flask_present():
-    from flask import request as request_obj
-    import flask as flask
-
-    _current_request = request_obj
-    _flask = flask
+import fcntl
+import logging
+from flask import request
+from flask import g
+import threading
+from logging.handlers import TimedRotatingFileHandler
 
 
 class MultiProcessTimedRotatingFileHandler(TimedRotatingFileHandler):
@@ -129,39 +105,160 @@ class MultiProcessTimedRotatingFileHandler(TimedRotatingFileHandler):
         return open(lock_file, 'w')
 
 
-class FlaskRequestAdapter(object):
-    def get_url(self):
-        return _current_request.url
+class ExecutedOutsideContext(Exception):
+    """
+    Exception to be raised if a fetcher was called outside its context
+    """
+    pass
 
-    def get_path(self):
-        return _current_request.full_path
 
-    def get_content_length(self):
-        return _current_request.content_length
+class MultiContextRequestIdFetcher(object):
+    """
+    A callable that can fetch request id from different context as Flask, Celery etc.
+    """
 
-    def get_method(self):
-        return _current_request.method
+    def __init__(self):
+        """
+        Initialize
+        """
+        self.ctx_fetchers = []
 
-    def get_server_ip(self):
+    def __call__(self):
+
+        for ctx_fetcher in self.ctx_fetchers:
+            try:
+                return ctx_fetcher()
+            except ExecutedOutsideContext:
+                continue
+        return None
+
+    def register_fetcher(self, ctx_fetcher):
+        """
+        Register another context-specialized fetcher
+        :param Callable ctx_fetcher: A callable that will return the id or raise ExecutedOutsideContext if it was
+         executed outside its context
+        """
+        if ctx_fetcher not in self.ctx_fetchers:
+            self.ctx_fetchers.append(ctx_fetcher)
+
+
+NO_REQUEST_ID = "none"
+
+
+def dj_ctx_get_request_id():
+    local = threading.local()
+    req_id = getattr(local, 'request_id', NO_REQUEST_ID)
+    return req_id
+
+
+def flask_ctx_get_request_id():
+    """
+    Get request id from flask's G object
+    :return: The id or None if not found.
+    """
+    from flask import _app_ctx_stack as stack  # We do not support < Flask 0.9
+
+    if stack.top is None:
+        raise ExecutedOutsideContext()
+
+    g_object_attr = stack.top.app.config['LOG_REQUEST_ID_G_OBJECT_ATTRIBUTE']
+    return g.get(g_object_attr, None)
+
+
+current_request_id = MultiContextRequestIdFetcher()
+current_request_id.register_fetcher(flask_ctx_get_request_id)
+
+
+# DEFAULT_FORMAT = logging.Formatter("%(asctime)s - %(reqId)s - [%(levelname)s]  - %(filename)s - %(lineno)d - "
+#                                    "[%(process)d:%(thread)d] - %(reqUri)s - [%(other)s]:  %(message)s")
+DEFAULT_FORMAT = logging.Formatter("%(asctime)s - %(reqId)s - [%(levelname)s]  - %(filename)s - %(lineno)d - "
+                                   "[%(process)d:%(thread)d] - %(message)s")
+
+
+class RequestIDLogFilter(logging.Filter):
+    """
+    Log filter to inject the current request id of the request under `log_record.request_id`
+    """
+
+    def filter(self, log_record):
+        log_record.reqId = current_request_id()
+        return log_record
+
+
+class HTTPInfo(object):
+    def __init__(self, request_obj, resp_obj):
+        super(HTTPInfo, self).__init__()
+        self._request = request_obj
+        self._response = resp_obj
+
+    def get_req_uri(self):
+        raise NotImplemented
+
+    def get_http_method(self):
+        raise NotImplemented
+
+    @staticmethod
+    def get_server_ip():
         return socket.gethostname()
 
     def get_client_ip(self):
-        real_ip = _current_request.headers.get('X-Real-Ip', _current_request.remote_addr)
+        raise NotImplemented
+
+    def get_sdk_version(self):
+        raise NotImplemented
+
+    @staticmethod
+    def is_json_type(content_type):
+        return content_type == 'application/json'
+
+    def get_req_data(self):
+        raise NotImplemented
+
+    def get_agent_type(self):
+        raise NotImplemented
+
+    def get_status_code(self):
+        return self._response.status_code
+
+    def get_resp_size(self):
+        return self._response.calculate_content_length()
+
+    def get_resp_content_type(self):
+        return self._response.content_type
+
+
+class FlaskHttpInfo(HTTPInfo):
+
+    def __init__(self, request_obj, resp_obj):
+        super(FlaskHttpInfo, self).__init__(request_obj, resp_obj)
+
+    def get_req_uri(self):
+        return self._request.full_path
+
+    def get_http_method(self):
+        return self._request.method
+
+    def get_client_ip(self):
+        real_ip = self._request.headers.get('X-Real-Ip', request.remote_addr)
         return real_ip
 
-    def get_http_header(self):
-        return _current_request.headers
+    def get_sdk_version(self):
+        return self._request.headers.get('SDKVersion')
 
-    def get_user_agent(self):
-        return _current_request.headers.get('user_agent')
+    def get_req_data(self):
+        if self.is_json_type(request.mimetype):
+            data = self._request.data
+        else:
+            data = self._request.json
+        return data
 
     def get_agent_type(self):
         """
         获取请求来源
         """
-        browser = _current_request.user_agent.browser
-        platform = _current_request.user_agent.platform
-        uas = _current_request.user_agent.string
+        browser = self._request.user_agent.browser
+        platform = self._request.user_agent.platform
+        uas = self._request.user_agent.string
         client = 'web'
         browser_tuples = ('safari', 'chrome')
         if platform == 'iphone':
@@ -179,13 +276,17 @@ class FlaskRequestAdapter(object):
             client = 'BlackBerry'
         return client
 
+    @staticmethod
+    def get_client_version():
+        return request.headers.get('SDKVersion')
+
     def get_userid(self):
         """
         获取账号ID
         :return:
         """
-        userid = _current_request.args.get('accountid') or _current_request.args.get('account_id') \
-                 or _current_request.args.get('userid')
+        userid = self._request.args.get('accountid') or self._request.args.get('account_id') or \
+                 self._request.args.get('userid')
         return userid
 
     def get_login_token(self):
@@ -193,243 +294,126 @@ class FlaskRequestAdapter(object):
         获取登录token
         :return:
         """
-        token = _current_request.headers.get('token') or _current_request.args.get('sessionid')
+        token = self._request.headers.get('token') or self._request.args.get('sessionid')
         return token
 
-    def get_req_data(self):
-        req_data = _current_request.data
-        # 如果不为空，则转json
-        if bytes.decode(req_data):
-            data = _current_request.json or _current_request.form
-            return data
-        else:
-            return None
-
-    def set_req_id(self, value):
-        _flask.g.request_id = value
-
-    def get_req_id_in_request_context(self):
-        return _flask.g.get('request_id', None)
-
-
-class FlaskResponseAdapter(object):
-    def get_status_code(self, response):
-        return response.status_code
-
-    def get_response_size(self, response):
-        return response.calculate_content_length()
-
-    def get_content_type(self, response):
-        return response.content_type
-
-
-class RequestUtil(object):
-    def __init__(self, request_adapter_class=FlaskRequestAdapter, response_adapter_class=FlaskResponseAdapter):
-        self.request_adapter = request_adapter_class()
-        self.response_adapter = response_adapter_class()
-
-    def get_reqId(self):
-        reqId = self.request_adapter.get_req_id_in_request_context()
-        return reqId
-
-
-class RequestInfo(dict):
-    """
-        class that keep HTTP request information for request instrumentation logging
-    """
-
-    def __init__(self, request, **kwargs):
-        super(self.__class__, self).__init__(**kwargs)
-        self.request_start = datetime.utcnow()
-        req_adapter = _request_util.request_adapter
-        self.serverIp = socket.gethostname()
-        self.clientIp = req_adapter.get_client_ip()
-        self.logSource = req_adapter.get_agent_type()
-        self.userId = req_adapter.get_userid()
-        self.token = req_adapter.get_login_token()
-        self.reqMethod = req_adapter.get_method()
-        self.reqUrl = req_adapter.get_url()
-        # print(self.reqUrl)
-        self.reqUri = req_adapter.get_path()
-        self.reqData = req_adapter.get_req_data()
-        self.device = req_adapter.get_user_agent()
-        # 生成唯一的reqID, 用于track request的周期
-        req_id = str(REQ_ID_GENERATOR().hex)
-        req_adapter.set_req_id(req_id)
-
-    # noinspection PyAttributeOutsideInit
-    def update_response_status(self, response):
-        """
-        update response information into this object, must be called before invoke request logging statement
-        :param response:
-        """
-        response_adapter = _request_util.response_adapter
-        time_delta = datetime.utcnow() - self.request_start
-        self.respTimeMs = int(time_delta.total_seconds()) * 1000 + int(time_delta.microseconds / 1000)
-        self.respStat = response_adapter.get_status_code(response)
-        self.respSizeB = response_adapter.get_response_size(response)
-        self.respContentType = response_adapter.get_content_type(response)
-
-    def pack_data(self):
-        res = {}
-        for key in self.__dict__:
-            res[key] = self.__dict__.get(key)
-        return res
-
-
-class ReqLogFormat(logging.Formatter):
-    """
-    req/resp相关日志
-    """
-    def format(self, record):
-        request_adapter = _request_util.request_adapter
-        json_log_object = {"type": "request",
-                           "ascTime": iso_time_format(datetime.utcnow()),
-                           "service": PLATFORM_CODE,
-                           "reqId": _request_util.get_reqId(),
-                           "reqUri": request_adapter.get_path(),
-                           "serverIp": request_adapter.get_server_ip(),
-                           "clientIp": request_adapter.get_client_ip(),
-                           "logSource": request_adapter.get_agent_type(),
-                           "userId": request_adapter.get_userid(),
-                           "token": request_adapter.get_login_token(),
-                           "reqMethod": request_adapter.get_method(),
-                           "reqData": request_adapter.get_req_data(),
-                           "device": request_adapter.get_user_agent(),
-                           "respStat": record.request_info.respStat,
-                           "respTimeMs": record.request_info.respTimeMs,
-                           "respSizeB": record.request_info.respSizeB,
-                           "respContentType": record.request_info.respContentType,
-                           "msg": record.getMessage()
-                           }
-
-        return JSON_SERIALIZER(json_log_object)
-
-
-# after request记录
-class WebLogFormat(logging.Formatter):
-    """
-    web log
-    """
-    def get_exc_fields(self, record):
-        if record.exc_info:
-            exc_info = self.format_exception(record.exc_info)
-        else:
-            exc_info = record.exc_text
-        return {
-            'exc_info': exc_info,
-            'filename': record.filename,
-        }
-
-    @classmethod
-    def format_exception(cls, exc_info):
-
-        return ''.join(traceback.format_exception(*exc_info)) if exc_info else ''
-
-    def format(self, record):
-        request_adapter = _request_util.request_adapter
-        json_log_object = {"type": "log",
-                           "ascTime": iso_time_format(datetime.utcnow()),
-                           "service": PLATFORM_CODE,
-                           "reqId": _request_util.get_reqId(),
-                           "logger": record.name,
-                           "thread": record.threadName,
-                           "level": record.levelname,
-                           "module": record.module,
-                           "line_no": record.lineno,
-                           "serverIp": request_adapter.get_server_ip(),
-                           "clientIp": request_adapter.get_client_ip(),
-                           "logSource": request_adapter.get_agent_type(),
-                           "msg": record.getMessage()
-                           }
-
-        if hasattr(record, 'props'):
-            json_log_object.update(record.props)
-
-        if record.exc_info or record.exc_text:
-            json_log_object.update(self.get_exc_fields(record))
-
-        return JSON_SERIALIZER(json_log_object)
+    def get_info(self):
+        data = dict()
+        # data['request_start'] = datetime.utcnow()
+        data['serverIp'] = self.get_server_ip()
+        data['clientIp'] = self.get_client_ip()
+        data['logSource'] = self.get_agent_type()
+        data['reqMethod'] = self.get_http_method()
+        data['reqData'] = self.get_req_data()
+        data['reqUri'] = self.get_req_uri()
+        data['device'] = self.get_agent_type()
+        data['sdkVersion'] = self.get_sdk_version()
+        data['userId'] = self.get_userid()
+        data['token'] = self.get_login_token()
+        data['respStat'] = self.get_status_code()
+        data['respSizeB'] = self.get_resp_size()
+        data['respContentType'] = self.get_resp_content_type()
+        return data
 
 
 class FlaskLogStash(object):
-    def __init__(self, app=None, req_format=ReqLogFormat, web_format=WebLogFormat):
-        self._web_format = web_format()
-        self._req_format = req_format()
-        self._request_logger = logging.getLogger('flask-request-logger')
-        self._request_logger.setLevel(logging.DEBUG)
-        self._web_logger = logging.getLogger('flask-web-logger')
-        self._web_logger.setLevel(logging.DEBUG)
+    def __init__(self, log_format=DEFAULT_FORMAT, level='DEBUG', app=None):
+        self.log_format = log_format
+        self.level = level
+        self._logger = logging.getLogger('cc-logger')
+        self._logger.setLevel(logging.DEBUG)
+
         if app:
             self.app = app
             self.init_app(app)
 
     @property
-    def request_logger(self):
-        return self._request_logger
+    def last_req_id(self):
+        try:
+            return g.last_req_id
+        except Exception:
+            pass
+        return getattr(self, '_last_req_id', None)
+
+    @last_req_id.setter
+    def last_req_id(self, value):
+        """
+        reqID
+        :param value:
+        :return:
+        """
+        self._last_req_id = value
+        try:
+            g.last_req_id = value
+        except Exception:
+            pass
 
     @property
-    def web_logger(self):
-        return self._web_logger
+    def last_request_start(self):
+        """
+        request开始的时间
+        :return:
+        """
+        try:
+            return g.last_request_start
+        except Exception:
+            pass
+        return getattr(self, '_last_request_start', None)
+
+    @last_request_start.setter
+    def last_request_start(self, value):
+        self._last_request_start = value
+        try:
+            g.last_request_start = value
+        except Exception:
+            pass
+
+    @property
+    def logger(self):
+        return self._logger
+
+    @logger.setter
+    def logger(self, val):
+        self._logger = val
 
     def init_app(self, app):
-        if not is_flask_present():
-            raise RuntimeError("flask is not available in system runtime")
-        from flask.app import Flask
-        if not isinstance(app, Flask):
-            raise RuntimeError("app is not a valid flask.app.Flask app instance")
-
-        global _request_util
-        _request_util = RequestUtil(request_adapter_class=FlaskRequestAdapter,
-                                    response_adapter_class=FlaskResponseAdapter)
-
         log_path = app.config.get('LOGPATH', 'app.log')
 
-        def __init_logger(logger, log_path, formatter):
+        def __init_logger(logger, log_path, level, formatter):
             fh = MultiProcessTimedRotatingFileHandler(log_path, when='MIDNIGHT', interval=1)
-            fh.setLevel(logging.DEBUG)
+            fh.setLevel(level)
 
             # 再创建一个handler，用于输出到控制台
             ch = logging.StreamHandler()
-            ch.setLevel(logging.DEBUG)
+            ch.setLevel(level)
             # 定义handler的输出格式
             fh.setFormatter(formatter)
             ch.setFormatter(formatter)
 
+            log_filter = RequestIDLogFilter()
+            fh.addFilter(log_filter)
+            ch.addFilter(log_filter)
             # 给logger添加handler
             logger.addHandler(fh)
             logger.addHandler(ch)
-
-        # todo 两个logger共用一个文件
-        __init_logger(self.request_logger, log_path, self._req_format)
-        __init_logger(self.web_logger, log_path, self._web_format)
-
-        # from flask import current_app
-        # current_app.
-        from flask import g
+        __init_logger(self.logger, log_path, self.level, self.log_format)
 
         @app.before_request
         def before_request():
-            # todo req记录
-            g.request_info = RequestInfo(_current_request)
+            self.last_req_id = str(uuid.uuid1().hex)
+            self.last_request_start = datetime.utcnow()
 
         @app.after_request
         def after_request(response):
-            # print(app.before_request_funcs)
-            request_info = g.request_info
-            response.headers.add('requestID', g.request_id)
-            request_info.update_response_status(response)
-            self.request_logger.debug("Request", extra={'request_info': request_info})
+            if self.last_req_id:
+                response.headers['X-req-ID'] = self.last_req_id
+            http_info = FlaskHttpInfo(request, response).get_info()
+            req_url = http_info.pop('reqUri', '')
+            time_delta = datetime.utcnow() - self.last_request_start
+            http_info['respTimeMs'] = int(time_delta.total_seconds()) * 1000 + int(time_delta.microseconds / 1000)
+            log_http_str = "&".join("%s=%s" % (k, v) for k, v in http_info.items())
+            extra_msg = "%s %s %s" % (req_url, log_http_str, 'Request')
+            self.logger.debug(extra_msg)
             return response
-
-
-
-
-
-
-
-
-
-
 
 
