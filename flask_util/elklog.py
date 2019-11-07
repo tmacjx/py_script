@@ -322,7 +322,8 @@ class FlaskLogStash(object):
         self.level = level
         self._logger = logging.getLogger('cc-logger')
         self._logger.setLevel(logging.DEBUG)
-
+        self._logger.propagate = 0
+        
         if app:
             self.app = app
             self.init_app(app)
