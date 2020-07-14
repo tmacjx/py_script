@@ -8,11 +8,48 @@ import grequests
 import logging
 import requests
 import json
+from requests.exceptions import RequestException
+from urllib.error import URLError, HTTPError
+import xmltodict
 
 
 logger = logging.getLogger("test")
 
 
+def xml_to_dict(xml_str):
+    data_dict = xmltodict.parse(xml_str)
+    return data_dict
+
+
+def api_retry(retry_num=3, exception=Exception, raise_except=True):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            nonlocal exception
+            success = False
+            for i in range(0, retry_num):
+                logger.debug('request count %s %s %s' % (i, args, kwargs))
+                try:
+                    response = func(*args, **kwargs)
+                except Exception as e:
+                    logger.error('业务相关error %s' % e, exc_info=True)
+                    exception = e
+                    continue
+                else:
+                    return response
+            if isinstance(exception, (RequestException, URLError, HTTPError)):
+                pass
+                # 发送报警
+                # send_alarm(message=str(exception.args))
+            if not success:
+                if raise_except:
+                    raise exception
+                else:
+                    return {'result': "FAIL"}
+        return wrapper
+    return decorator
+
+
+@api_retry(raise_except=False)
 def request_api(
         url,
         http_method='GET',
@@ -38,12 +75,19 @@ def request_api(
 
     headers['Accept'] = 'application/json'
 
+    before_time = int(time.time() * 1000)
     response = requests.request(http_method, url, params=query_params,
                                 headers=headers, data=data,
                                 files=files, timeout=timeout)
+    consume_time = int(time.time() * 1000) - before_time
+    logger.info('请求API {url} {params} {data} 耗时{consume_time} '.format(
+        url=url, params=query_params, data=post_args, consume_time=consume_time))
+
     content_type = response.headers.get('content-type', 'application/json')
     if "application/json" in content_type:
         resp_data = response.json()
+    elif 'xml' in content_type:
+        resp_data = xml_to_dict(response.content)
     else:
         resp_data = response.text
     http_status = response.status_code
@@ -51,31 +95,12 @@ def request_api(
         logger.error('请求API失败 {url} {data} {status} '
                      '{resp_data}'.format(url=url, data=data, status=http_status, resp_data=resp_data))
         return
-    logger.info('请求API成功 {url} {data} {status} {resp_data}'.format(
-        url=url, data=data, status=http_status, resp_data=resp_data))
+    if resp_data.get('result') in {'OK', 'ok', 1} or bool(resp_data.get('success')) is True \
+            or data.get('isValid') in {'True', 'true', True}:
+        resp_data['result'] = 'OK'
+    else:
+        resp_data['result'] = 'FAIL'
     return resp_data
-
-
-def api_retry(retry_num=3, exception=Exception):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            nonlocal exception
-            success = False
-            for i in range(0, retry_num):
-                logger.debug('request count %s %s %s' % (i, args, kwargs))
-                try:
-                    response = func(*args, **kwargs)
-                except Exception as e:
-                    logger.error('业务相关error %s' % e, exc_info=True)
-                    exception = e
-                    continue
-                else:
-                    return response
-            # 如果重试三次失败, 则raise
-            if not success:
-                raise exception
-        return wrapper
-    return decorator
 
 
 class APIClient(object):
